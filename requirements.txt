@@ -1,0 +1,7 @@
+langgraph>=0.3
+openai>=1.50
+tavily-python>=0.5
+pydantic>=2.5
+python-dotenv>=1.0
+streamlit>=1.40
+pytest>=8.0
