@@ -5,6 +5,7 @@ A failure inside a node is recorded in state["errors"] instead of crashing the r
 """
 
 import logging
+import re
 
 from agent.config import Config
 from agent.llm import LLM
@@ -175,3 +176,82 @@ class Nodes:
         if follow_up:
             question.query = follow_up  # used if the loop comes back for another try
         return accepted
+
+    # LOOP Decision
+    def route(self, state: State) -> str:
+        """After Research, open questions exist and budget positive do research again."""
+
+        open_questions = any(not q.done for q in state["questions"])
+        if open_questions and state["searches"] < self.cfg.max_searches:
+            return "research"
+        return "write"
+
+    # Writer to prepare the final report
+    def write(self, state: State) -> dict:
+        claims = state["claims"]
+        questions = state["questions"]
+        errors = list(state["errors"])
+
+        if not claims:
+            report = f"# {state['topic']}\n\nNo verified findings were found." + self._limitations(
+                questions, errors
+            )
+
+            return {"report": report, "errors": errors}
+
+        claim_lines = []
+
+        for q in questions:
+            question_claims = [c for c in claims if c.question_id == q.id]
+
+            if question_claims:
+                claim_lines.append(f"## {q.text}")
+
+                for c in question_claims:
+                    claim_lines.append(f"- {c.statement} [{c.source_id}]")
+
+        claim_lines = "\n\n".join(claim_lines)
+
+        prompt = (
+            "TASK: WRITE\n"
+            f"Write a clear markdown research report on: {state['topic']}\n"
+            "Use ONLY the verified findings below. Do not add facts. Keep the citation "
+            "numbers like [3] exactly as given, placed right after the sentence they support.\n"
+            "Structure: a title, a 3-sentence summary, then one short section per question.\n\n"
+            f"Verified findings:\n{claim_lines}"
+        )
+
+        try:
+            body = self.llm.text(prompt).strip()
+        except Exception as exc:
+            errors.append(f"Report writing failed ({exc}); showing raw findings.")
+            body = f"# {state['topic']}\n\n{claim_lines}"
+
+        # Keep only valid citation numbers
+        valid = {c.source_id for c in claims}
+
+        def keep_valid(match):
+            return match.group() if int(match.group(1)) in valid else ""
+
+        body = re.sub(r"\[(\d+)\]", keep_valid, body)
+
+        # Find cited sources
+        cited = {int(n) for n in re.findall(r"\[(\d+)\]", body)} or valid
+
+        # Build the source list
+        refs = "\n".join(f"[{s.id}] {s.title} - {s.url}" for s in state["sources"] if s.id in cited)
+
+        report = f"{body}\n\n## Sources\n{refs}" + self._limitations(questions, errors)
+        return {"report": report, "errors": errors}
+
+    @staticmethod
+    def _limitations(questions, errors) -> str:
+        gaps = [q.text for q in questions if not q.answered]
+        text = ""
+        if gaps:
+            text += "\n\n## Limitations\nNot enough verified evidence for:\n" + "\n".join(
+                f"- {g}" for g in gaps
+            )
+        if errors:
+            text += f"\n\n_{len(errors)} step(s) had errors; see logs._"
+        return text

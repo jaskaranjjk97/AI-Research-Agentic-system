@@ -1,13 +1,17 @@
 from agent.config import Config
+from agent.models import Claim, Question, Source
 from agent.nodes import Nodes
 
 
 class FakeLLM:
     """Stands in for the real LLM: returns whatever we script, no API call."""
 
-    def __init__(self, plan=None, extract=None):
+    def __init__(
+        self, plan=None, extract=None, write="# Solar\nPanels make power [1]. Invented [9]."
+    ):
         self.plan_data = plan if plan is not None else {"questions": ["How does solar work?"]}
         self.extract_data = extract  # a function: prompt -> dict
+        self.write_text = write
 
     def json(self, prompt):
         if "TASK: PLAN" in prompt:
@@ -17,6 +21,11 @@ class FakeLLM:
         if "TASK: EXTRACT" in prompt:
             return self.extract_data(prompt)
         raise AssertionError("unexpected prompt")
+
+    def text(self, prompt):
+        if isinstance(self.write_text, Exception):
+            raise self.write_text
+        return self.write_text
 
 
 def make(llm, searcher=None, **cfg):
@@ -199,3 +208,68 @@ def test_extraction_failure_is_recorded_not_raised():
     state = run_verify(boom)
     assert state["claims"] == []
     assert any("Claim extraction failed" in e for e in state["errors"])
+
+
+# ---- route: should the agent search again? ---------------------------------
+def test_route_continues_while_questions_are_open_and_budget_remains():
+    state = {"questions": [Question(id="q1", text="a?")], "searches": 1}
+    assert make(FakeLLM()).route(state) == "research"
+
+
+def test_route_writes_when_every_question_is_done():
+    state = {"questions": [Question(id="q1", text="a?", done=True)], "searches": 1}
+    assert make(FakeLLM()).route(state) == "write"
+
+
+def test_route_stops_when_the_search_budget_is_spent():
+    state = {"questions": [Question(id="q1", text="a?")], "searches": 3}
+    assert make(FakeLLM(), max_searches=3).route(state) == "write"
+
+
+# ---- write: the report -----------------------------------------------------
+def final_state(**override):
+    state = {
+        "topic": "solar",
+        "questions": [Question(id="q1", text="How does solar work?", done=True, answered=True)],
+        "sources": [
+            Source(id=1, title="Page one", url="http://one", content="x"),
+            Source(id=2, title="Page two", url="http://two", content="y"),
+        ],
+        "claims": [
+            Claim(statement="Panels make power", quote=QUOTE, source_id=1, question_id="q1")
+        ],
+        "errors": [],
+    }
+    state.update(override)
+    return state
+
+
+def test_write_removes_invented_citations_and_lists_only_cited_sources():
+    report = make(FakeLLM()).write(final_state())["report"]
+
+    assert "[9]" not in report
+    assert "[1]" in report
+    assert "[1] Page one - http://one" in report
+    assert "Page two" not in report  # never cited
+    assert "Limitations" not in report
+
+
+def test_write_lists_unanswered_questions_as_limitations():
+    questions = [Question(id="q1", text="Why is the sky blue?", done=True, answered=False)]
+    report = make(FakeLLM()).write(final_state(questions=questions))["report"]
+
+    assert "## Limitations" in report
+    assert "Why is the sky blue?" in report
+
+
+def test_write_without_claims_does_not_call_the_llm():
+    llm = FakeLLM(write=RuntimeError("must not be called"))
+    report = make(llm).write(final_state(claims=[]))["report"]
+    assert "No verified findings" in report
+
+
+def test_write_falls_back_to_raw_findings_when_the_llm_fails():
+    update = make(FakeLLM(write=RuntimeError("boom"))).write(final_state())
+
+    assert "Panels make power [1]" in update["report"]
+    assert any("Report writing failed" in e for e in update["errors"])
