@@ -5,14 +5,17 @@ from agent.nodes import Nodes
 class FakeLLM:
     """Stands in for the real LLM: returns whatever we script, no API call."""
 
-    def __init__(self, plan=None):
+    def __init__(self, plan=None, extract=None):
         self.plan_data = plan if plan is not None else {"questions": ["How does solar work?"]}
+        self.extract_data = extract  # a function: prompt -> dict
 
     def json(self, prompt):
         if "TASK: PLAN" in prompt:
             if isinstance(self.plan_data, Exception):
                 raise self.plan_data
             return self.plan_data
+        if "TASK: EXTRACT" in prompt:
+            return self.extract_data(prompt)
         raise AssertionError("unexpected prompt")
 
 
@@ -119,3 +122,80 @@ def test_search_failure_is_recorded_not_raised():
     assert update["batch"] == []
     assert update["questions"][0].attempts == 1
     assert any("Search failed" in e for e in update["errors"])
+
+
+QUOTE = "Solar panels convert sunlight directly into electricity."
+
+
+def run_verify(extract, page_text=QUOTE, **cfg):
+    """plan -> research -> verify on one fake page, like the real graph does."""
+    searcher = FakeSearcher(lambda q: [hit("http://a", "Intro. " + page_text + " More.")])
+    nodes = make(FakeLLM(extract=extract), searcher, **cfg)
+    state = planned(nodes)
+    state.update(nodes.research(state))
+    state.update(nodes.verify(state))
+    return state
+
+
+def claim(quote=QUOTE, source_id=1):
+    return {"statement": "A fact", "quote": quote, "source_id": source_id}
+
+
+def test_verify_keeps_claim_whose_quote_is_in_the_source():
+    state = run_verify(lambda p: {"claims": [claim()]}, min_claims=1)
+
+    assert len(state["claims"]) == 1
+    assert state["claims"][0].question_id == "q1"
+    assert state["questions"][0].done and state["questions"][0].answered
+
+
+def test_verify_rejects_an_invented_quote():
+    invented = claim("Solar is cheap and everyone knows it.")
+    state = run_verify(lambda p: {"claims": [invented]})
+
+    assert state["claims"] == []
+    assert not state["questions"][0].done  # one attempt used, one left
+
+
+def test_quote_matching_ignores_case_spacing_and_curly_quotes():
+    page = "It\u2019s clear that solar panels convert sunlight into electricity."
+    quote = "it's clear  that SOLAR panels convert sunlight into electricity."
+    state = run_verify(lambda p: {"claims": [claim(quote)]}, page_text=page)
+
+    assert len(state["claims"]) == 1
+
+
+def test_verify_rejects_a_quote_that_is_too_short():
+    state = run_verify(lambda p: {"claims": [claim("Solar")]})
+    assert state["claims"] == []
+
+
+def test_verify_rejects_a_claim_citing_a_source_not_in_the_batch():
+    state = run_verify(lambda p: {"claims": [claim(source_id=99)]})
+    assert state["claims"] == []
+
+
+def test_verify_drops_duplicate_quotes():
+    state = run_verify(lambda p: {"claims": [claim(), claim(QUOTE.upper())]})
+    assert len(state["claims"]) == 1
+
+
+def test_follow_up_query_is_saved_for_the_retry():
+    state = run_verify(lambda p: {"claims": [], "follow_up_query": "better query"})
+    assert state["questions"][0].query == "better query"
+
+
+def test_question_gives_up_after_max_attempts():
+    state = run_verify(lambda p: {"claims": []}, max_attempts=1)
+
+    assert state["questions"][0].done
+    assert not state["questions"][0].answered
+
+
+def test_extraction_failure_is_recorded_not_raised():
+    def boom(prompt):
+        raise ValueError("bad json")
+
+    state = run_verify(boom)
+    assert state["claims"] == []
+    assert any("Claim extraction failed" in e for e in state["errors"])
