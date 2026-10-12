@@ -41,3 +41,81 @@ def test_plan_falls_back_to_topic_when_llm_fails():
 
     assert [q.text for q in update["questions"]] == ["solar power"]
     assert any("Planning failed" in e for e in update["errors"])
+
+
+class FakeSearcher:
+    """Stands in for Tavily: returns whatever we script, no internet."""
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.queries = []
+
+    def search(self, query):
+        self.queries.append(query)
+        return self.fn(query)
+
+
+def hit(url, text="some page text"):
+    return {"title": f"Title {url}", "url": url, "content": text}
+
+
+def planned(nodes, topic="X"):
+    """Run the planner first, like the real graph does."""
+    state = {"topic": topic}
+    state.update(nodes.plan(state))
+    return state
+
+
+def test_research_numbers_sources_and_counts_the_search():
+    searcher = FakeSearcher(lambda q: [hit("http://a"), hit("http://b")])
+    nodes = make(FakeLLM(plan={"questions": ["a?", "b?"]}), searcher)
+    state = planned(nodes)
+
+    update = nodes.research(state)
+
+    assert searcher.queries == ["a?"]
+    assert [s.id for s in update["sources"]] == [1, 2]
+    assert update["batch"] == [1, 2]
+    assert update["current"] == "q1"
+    assert update["searches"] == 1
+    assert update["questions"][0].attempts == 1
+
+
+def test_research_skips_done_questions_and_uses_follow_up_query():
+    searcher = FakeSearcher(lambda q: [hit("http://a")])
+    nodes = make(FakeLLM(plan={"questions": ["a?", "b?"]}), searcher)
+    state = planned(nodes)
+    state["questions"][0].done = True
+    state["questions"][1].query = "better query"
+
+    update = nodes.research(state)
+
+    assert searcher.queries == ["better query"]
+    assert update["current"] == "q2"
+
+
+def test_same_url_keeps_the_same_citation_number():
+    searcher = FakeSearcher(lambda q: [hit("http://same")])
+    nodes = make(FakeLLM(plan={"questions": ["a?", "b?"]}), searcher)
+    state = planned(nodes)
+    state.update(nodes.research(state))
+    state["questions"][0].done = True
+    state.update(nodes.research(state))
+
+    assert len(state["sources"]) == 1
+    assert state["batch"] == [1]
+    assert state["searches"] == 2
+
+
+def test_search_failure_is_recorded_not_raised():
+    def boom(query):
+        raise RuntimeError("429 rate limit")
+
+    nodes = make(FakeLLM(), FakeSearcher(boom))
+    state = planned(nodes)
+
+    update = nodes.research(state)
+
+    assert update["batch"] == []
+    assert update["questions"][0].attempts == 1
+    assert any("Search failed" in e for e in update["errors"])
