@@ -1,0 +1,5 @@
+line-length = 100
+
+[lint]
+select = ["E", "F", "I"]   # style errors, unused code, import order
+ignore = ["BLE001"]         # we deliberately catch Exception so one failure never kills a run

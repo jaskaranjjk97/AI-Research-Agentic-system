@@ -7,8 +7,15 @@ log = logging.getLogger(__name__)
 
 
 class Searcher:
-    def __init__(self, api_key: str, max_results: int = 5, max_chars: int = 6000,
-                 retries: int = 3, backoff: float = 2.0, client=None):
+    def __init__(
+        self,
+        api_key: str,
+        max_results: int = 5,
+        max_chars: int = 6000,
+        retries: int = 3,
+        backoff: float = 2.0,
+        client=None,
+    ):
         if client is None:
             if not api_key:
                 raise ValueError("TAVILY_API_KEY is missing. Add it to your .env file.")
@@ -33,15 +40,17 @@ class Searcher:
                 log.warning("Search attempt %d/%d failed: %s", attempt, self.retries, exc)
                 if attempt == self.retries:
                     raise  # out of retries: let the caller decide what to do
-                time.sleep(self.backoff ** attempt)  # wait 2s, then 4s ...
+                time.sleep(self.backoff**attempt)  # wait 2s, then 4s ...
 
         results = []
         for item in response.get("results", []):
             text = item.get("raw_content") or item.get("content") or ""
             if item.get("url") and text.strip():
-                results.append({
-                    "title": item.get("title") or item["url"],
-                    "url": item["url"],
-                    "content": text[: self.max_chars],
-                })
+                results.append(
+                    {
+                        "title": item.get("title") or item["url"],
+                        "url": item["url"],
+                        "content": text[: self.max_chars],
+                    }
+                )
         return results
